@@ -41,6 +41,7 @@ class MessageBubble(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.set_margin_top(2)
         self.set_margin_bottom(2)
+        self.message = message
 
         # Sender badge
         badge = self._make_sender_badge(message, service)
@@ -50,6 +51,7 @@ class MessageBubble(Gtk.Box):
         bubble = Gtk.Button.new()
         bubble.add_css_class("message-bubble")
         bubble.set_can_focus(True)
+        self.button = bubble  # what keyboard navigation focuses
 
         # Accessible label for screen readers
         sender = "You" if message.is_outgoing else message.sender_id

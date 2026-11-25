@@ -165,3 +165,25 @@ def focus_is_lost(root: Gtk.Root | None) -> bool:
         or not focus.is_sensitive()
         or not focus.get_visible()
     )
+
+
+class _SingleTabListBox(Gtk.ListBox):
+    """Before GTK 4.18, a Tab from a focused row must continue in the parent."""
+
+    def do_focus(self, direction: Gtk.DirectionType) -> bool:
+        if direction in (Gtk.DirectionType.TAB_FORWARD, Gtk.DirectionType.TAB_BACKWARD):
+            if focus_within(self):
+                return False
+            row = self.get_selected_row()
+            if row is not None and row.grab_focus():
+                return True
+        return bool(Gtk.ListBox.do_focus(self, direction))
+
+
+def single_tab_list_box() -> Gtk.ListBox:
+    """Tab between lists and other controls, use arrow keys to select rows."""
+    if not hasattr(Gtk.ListBox, "set_tab_behavior"):
+        return _SingleTabListBox()
+    list_box = Gtk.ListBox.new()
+    list_box.set_tab_behavior(Gtk.ListTabBehavior.ITEM)
+    return list_box

@@ -19,6 +19,12 @@ from meshcore_console.ui_gtk.compat import (
     present_dialog,
 )
 from meshcore_console.ui_gtk.helpers import clear_children, clear_listbox, navigate
+from meshcore_console.ui_gtk.keyboard import (
+    activation_allowed,
+    focus_is_lost,
+    focus_within,
+    single_tab_list_box,
+)
 from meshcore_console.ui_gtk.layout import Layout
 from meshcore_console.ui_gtk.state import UiEventStore
 from meshcore_console.core.time import to_local
@@ -59,6 +65,44 @@ def messages_after(messages: list[Message], last_id: str | None) -> list[Message
     return None
 
 
+class DraftBook:
+    """Unsent text per thread (channel id, DM threads included), in memory.
+
+    Every edit bumps the thread's revision.  A send captures the revision
+    with the text, and its completion clears the draft only if the revision
+    is still the same: text typed while the send was on air, or a draft in
+    another thread, is never lost to a send finishing late.
+    """
+
+    def __init__(self) -> None:
+        self._text: dict[str, str] = {}
+        self._revision: dict[str, int] = {}
+
+    def get(self, channel_id: str) -> str:
+        return self._text.get(channel_id, "")
+
+    def revision(self, channel_id: str) -> int:
+        return self._revision.get(channel_id, 0)
+
+    def set(self, channel_id: str, text: str) -> None:
+        if self.get(channel_id) == text:
+            return
+        self._text[channel_id] = text
+        self._revision[channel_id] = self.revision(channel_id) + 1
+
+    def clear_if_unchanged(self, channel_id: str, revision: int) -> bool:
+        """Clear a sent draft; False (draft kept) if it was edited since ``revision``."""
+        if self.revision(channel_id) != revision:
+            return False
+        self.set(channel_id, "")
+        return True
+
+    def discard(self, channel_id: str) -> None:
+        """Forget a removed thread's text (the revision stays: a late send
+        completion must not match a new draft)."""
+        self._text.pop(channel_id, None)
+
+
 class MessagesView(Gtk.Box):
     def __init__(self, service: MeshcoreService, event_store: UiEventStore, layout: Layout) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -70,6 +114,15 @@ class MessagesView(Gtk.Box):
         self._sending = False
         self._last_message_date: str | None = None
         self._selected_message: Message | None = None
+        # The entry holds the draft of _composer_channel_id; it follows the
+        # selected thread in _sync_composer.
+        self._drafts = DraftBook()
+        self._composer_channel_id = self._selected_channel_id
+        self._restoring_draft = False
+        self._send_status_by_channel: dict[str, str] = {}
+        self._pending_compose_focus = False  # set by open_dm, used on the next view focus
+        self._history_anchor: str | None = None  # message id the history focus returns to
+        self._shown_channel_id: str | None = None  # the thread the history shows
 
         # Main content area (channels + chat)
         split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -86,7 +139,7 @@ class MessagesView(Gtk.Box):
         channel_scroll.set_vexpand(True)
         channel_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
-        self._channel_list = Gtk.ListBox.new()
+        self._channel_list = single_tab_list_box()
         self._channel_list.add_css_class("panel-card")
         self._channel_list.add_css_class("channel-list")
         self._channel_list.add_css_class("side-list")
@@ -104,6 +157,7 @@ class MessagesView(Gtk.Box):
         add_channel_btn.set_margin_top(4)
         add_channel_btn.set_margin_bottom(4)
         add_channel_btn.connect("clicked", self._on_add_channel_clicked)
+        self._add_channel_btn = add_channel_btn
         channel_panel.append(add_channel_btn)
 
         split.append(channel_panel)
@@ -176,10 +230,15 @@ class MessagesView(Gtk.Box):
         self._message_box.set_margin_bottom(8)
         self._scroll.set_child(self._message_box)
 
-        # Arrow key navigation between message bubbles
+        # Arrow key navigation between message bubbles; Tab leaves the history
         msg_key_ctrl = Gtk.EventControllerKey.new()
         msg_key_ctrl.connect("key-pressed", self._on_message_key)
         self._scroll.add_controller(msg_key_ctrl)
+        # The history is one Tab stop: entering it lands on the message it
+        # was left at (else the newest), not on the oldest one
+        history_focus = Gtk.EventControllerFocus.new()
+        history_focus.connect("enter", self._on_history_focus_enter)
+        self._message_box.add_controller(history_focus)
 
         # Message details revealer
         self._details_revealer = Gtk.Revealer.new()
@@ -228,11 +287,13 @@ class MessagesView(Gtk.Box):
         self._entry.set_placeholder_text("Type message and press Send")
         self._entry.set_hexpand(True)
         self._entry.connect("activate", self._on_send)
+        self._entry.connect("changed", self._on_entry_changed)
         compose.append(self._entry)
 
         self._send_button = Gtk.Button.new_with_label("Send")
         self._send_button.connect("clicked", self._on_send)
         compose.append(self._send_button)
+        self._composer = compose
         self._chat_panel.append(compose)
 
         self._send_status = Gtk.Label(label="")
@@ -343,10 +404,11 @@ class MessagesView(Gtk.Box):
         pos = self._entry.get_position()
         self._entry.insert_text(emoji, pos)
         self._entry.set_position(pos + len(emoji))
-        self._entry.grab_focus()
+        self._entry.grab_focus_without_selecting()  # grab_focus selects the whole draft
 
     def _refresh_compose_state(self) -> None:
         """Enable/disable compose area based on connection status."""
+        had_focus = focus_within(self._composer)
         connected = self._service.get_status().connected
         self._entry.set_sensitive(connected)
         self._send_button.set_sensitive(connected and not self._sending)
@@ -355,8 +417,18 @@ class MessagesView(Gtk.Box):
             self._entry.set_placeholder_text("Type message and press Send")
         else:
             self._entry.set_placeholder_text("Connect to radio to send messages")
+        if had_focus and self.get_mapped() and focus_is_lost(self.get_root()):
+            # Send (sending) or the whole composer (disconnected) was disabled
+            # under the focus
+            if self._entry.is_sensitive():
+                self._entry.grab_focus_without_selecting()
+            else:
+                self._focus_channel_row()
 
     def _reload_channels(self) -> None:
+        # A new thread (e.g. an incoming DM) rebuilds the list under the
+        # focused row: give the focus to the selected row afterwards
+        list_had_focus = focus_within(self._channel_list)
         clear_listbox(self._channel_list)
 
         channels = self._service.list_channels()
@@ -406,15 +478,26 @@ class MessagesView(Gtk.Box):
             self._selected_channel_id = getattr(
                 selected_row, "channel_id", self._selected_channel_id
             )
+            if list_had_focus:
+                selected_row.grab_focus()
 
         self._reload_messages()
 
     def _reload_messages(self) -> None:
+        self._sync_composer()
+        if self._shown_channel_id != self._selected_channel_id:
+            self._shown_channel_id = self._selected_channel_id
+            self._history_anchor = None
+        # A rebuild of the open thread takes the focused bubble (or the
+        # details' Close button) with it: put the focus back on the history.
+        history_had_focus = focus_within(self._message_box) or focus_within(self._details_revealer)
         clear_children(self._message_box)
 
         # Hide details when reloading
         self._details_revealer.set_reveal_child(False)
         self._selected_message = None
+        if history_had_focus:
+            GLib.idle_add(self._refocus_history)
 
         # Capture unread count before it gets reset
         channels = self._service.list_channels()
@@ -460,6 +543,7 @@ class MessagesView(Gtk.Box):
     def _on_message_clicked(self, _button: Gtk.Button, message: Message) -> None:
         """Show message details when clicked."""
         logger.debug("UI: message clicked id=%s", message.message_id)
+        self._history_anchor = message.message_id
         # Toggle if same message clicked again
         if self._selected_message and self._selected_message.message_id == message.message_id:
             self._details_revealer.set_reveal_child(False)
@@ -578,77 +662,168 @@ class MessagesView(Gtk.Box):
     def close_active_detail(self) -> bool:
         """Close the details panel if open. Returns True if something was closed."""
         if self._details_revealer.get_reveal_child():
-            self._details_revealer.set_reveal_child(False)
-            self._selected_message = None
+            self._hide_details()
             return True
         return False
 
+    def _hide_details(self) -> None:
+        had_focus = focus_within(self._details_revealer)
+        self._details_revealer.set_reveal_child(False)
+        self._selected_message = None
+        if had_focus:
+            self._refocus_history()  # back to the message whose details these were
+
+    def escape_focus(self) -> bool:
+        """Esc in the composer: back to browsing channels, the draft kept."""
+        if not focus_within(self._composer):
+            return False
+        return self._focus_channel_row()
+
     def get_default_focus(self) -> Gtk.Widget:
-        """Return the widget that should receive focus when this view is shown."""
-        return self._entry
+        """Return the widget that should receive focus when this view is shown.
+
+        Normally the selected channel's row, for browsing.  After open_dm
+        (Send Message elsewhere) the composer, if the thread is open and the
+        composer usable; else still the channel list.
+        """
+        compose, self._pending_compose_focus = self._pending_compose_focus, False
+        if (
+            compose
+            and self._composer_channel_id == self._selected_channel_id
+            and self._entry.is_sensitive()
+        ):
+            return self._entry
+        return self._selected_channel_row() or self._channel_list
+
+    def open_dm(self, channel_id: str) -> None:
+        """Open a DM thread to write in (Send Message in Peers and Map)."""
+        self.select_channel(channel_id)
+        self._pending_compose_focus = True
+
+    def _selected_channel_row(self) -> Gtk.ListBoxRow | None:
+        index = 0
+        while (row := self._channel_list.get_row_at_index(index)) is not None:
+            if getattr(row, "channel_id", None) == self._selected_channel_id:
+                return row
+            index += 1
+        return None
+
+    def _focus_channel_row(self) -> bool:
+        row = self._selected_channel_row()
+        if row is not None and row.grab_focus():
+            return True
+        return self._channel_list.grab_focus()
+
+    def _bubbles(self) -> list[MessageBubble]:
+        bubbles = []
+        child = self._message_box.get_first_child()
+        while child is not None:
+            if isinstance(child, MessageBubble):
+                bubbles.append(child)
+            child = child.get_next_sibling()
+        return bubbles
+
+    def _anchor_bubble(self) -> MessageBubble | None:
+        """The bubble the history focus returns to: the last one used, else the newest."""
+        bubbles = self._bubbles()
+        for bubble in bubbles:
+            if bubble.message.message_id == self._history_anchor:
+                return bubble
+        return bubbles[-1] if bubbles else None
+
+    def _refocus_history(self) -> bool:
+        bubble = self._anchor_bubble()
+        if bubble is not None:
+            bubble.button.grab_focus()
+        else:
+            self._focus_channel_row()
+        return False  # also an idle callback
+
+    def _on_history_focus_enter(self, controller: Gtk.EventControllerFocus) -> None:
+        """Tab (or an arrow key) into the history: go to the anchor bubble.
+
+        GTK would focus the first focusable child, the oldest message, and
+        scroll the view to it.  A click focuses what was clicked."""
+        event = controller.get_current_event()
+        if event is None or event.get_event_type() != Gdk.EventType.KEY_PRESS:
+            return
+        bubble = self._anchor_bubble()
+        if bubble is not None and not focus_within(bubble):
+            bubble.button.grab_focus()
+
+    def _leave_history(self, backward: bool) -> bool:
+        """Tab/Shift+Tab from a message: past the whole history, not to the
+        next message."""
+        if backward:
+            candidates: list[Gtk.Widget] = [self._channel_menu, self._add_channel_btn]
+            for widget in candidates:
+                if widget.is_sensitive() and widget.grab_focus():
+                    return True
+            return self._focus_channel_row()
+        if self._scroll_bottom_btn.get_visible() and self._scroll_bottom_btn.grab_focus():
+            return True
+        if self._details_revealer.get_reveal_child() and self._details_revealer.child_focus(
+            Gtk.DirectionType.TAB_FORWARD
+        ):
+            return True
+        for widget in (self._emoji_btn, self._entry, self._send_button):
+            if widget.is_sensitive() and widget.grab_focus():
+                return True
+        focus_header = getattr(self.get_root(), "focus_header", None)
+        return bool(focus_header is not None and focus_header())
 
     def _on_close_details(self, _button: Gtk.Button) -> None:
         logger.debug("UI: close message details")
-        self._details_revealer.set_reveal_child(False)
-        self._selected_message = None
+        self._hide_details()
 
     def _on_message_key(
         self,
         _controller: Gtk.EventControllerKey,
         keyval: int,
         _keycode: int,
-        _state: Gdk.ModifierType,
+        state: Gdk.ModifierType,
     ) -> bool:
-        """Navigate between message bubbles with Up/Down arrows."""
+        """Navigate between message bubbles with Up/Down arrows; Tab and
+        Shift+Tab leave the history."""
+        if keyval in (Gdk.KEY_Tab, Gdk.KEY_KP_Tab, Gdk.KEY_ISO_Left_Tab):
+            current = self._focused_bubble()
+            if current is None:
+                return False  # in the details or the jump button: GTK's order
+            self._history_anchor = current.message.message_id
+            backward = keyval == Gdk.KEY_ISO_Left_Tab or bool(state & Gdk.ModifierType.SHIFT_MASK)
+            return self._leave_history(backward)
         if keyval not in (Gdk.KEY_Up, Gdk.KEY_Down):
             return False
-
-        # Find the currently focused bubble
-        focus = self.get_root()
-        if focus is not None:
-            focus = focus.get_focus()
-        if focus is None:
+        if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
+            return False
+        if not focus_within(self._message_box):
             return False
 
-        # Walk up to the MessageBubble container (the Gtk.Box subclass)
-        current = (
-            focus.get_ancestor(MessageBubble) if not isinstance(focus, MessageBubble) else focus
-        )
+        bubbles = self._bubbles()
+        if not bubbles:
+            return False
+        current = self._focused_bubble()
         if current is None:
-            # No bubble focused — focus the first/last one
-            child = (
-                self._message_box.get_last_child()
-                if keyval == Gdk.KEY_Up
-                else self._message_box.get_first_child()
-            )
-            while child is not None:
-                if isinstance(child, MessageBubble):
-                    # Focus the button inside the bubble
-                    btn = child.get_first_child()
-                    while btn is not None:
-                        if isinstance(btn, Gtk.Button):
-                            btn.grab_focus()
-                            return True
-                        btn = btn.get_next_sibling()
-                child = (
-                    child.get_next_sibling() if keyval == Gdk.KEY_Down else child.get_prev_sibling()
-                )
-            return False
+            # No bubble focused: the newest going up, the oldest going down
+            target: MessageBubble | None = bubbles[-1] if keyval == Gdk.KEY_Up else bubbles[0]
+        else:
+            index = bubbles.index(current) + (-1 if keyval == Gdk.KEY_Up else 1)
+            target = bubbles[index] if 0 <= index < len(bubbles) else None
+        if target is None:
+            return True  # at the oldest/newest message: stay in the history
+        self._history_anchor = target.message.message_id
+        target.button.grab_focus()
+        return True
 
-        # Move to next/previous bubble
-        sibling = current.get_prev_sibling() if keyval == Gdk.KEY_Up else current.get_next_sibling()
-        while sibling is not None:
-            if isinstance(sibling, MessageBubble):
-                btn = sibling.get_first_child()
-                while btn is not None:
-                    if isinstance(btn, Gtk.Button):
-                        btn.grab_focus()
-                        return True
-                    btn = btn.get_next_sibling()
-            sibling = (
-                sibling.get_prev_sibling() if keyval == Gdk.KEY_Up else sibling.get_next_sibling()
-            )
-        return False
+    def _focused_bubble(self) -> MessageBubble | None:
+        root = self.get_root()
+        focus = root.get_focus() if root is not None else None
+        if focus is None:
+            return None
+        if isinstance(focus, MessageBubble):
+            return focus
+        bubble = focus.get_ancestor(MessageBubble)
+        return bubble if isinstance(bubble, MessageBubble) else None
 
     def _on_channel_selected(self, _listbox: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         if row is None:
@@ -769,6 +944,8 @@ class MessagesView(Gtk.Box):
         if response != "remove":
             return
         if self._service.remove_channel(channel_id):
+            self._drafts.discard(channel_id)
+            self._send_status_by_channel.pop(channel_id, None)
             # Switch to #public if we removed the currently selected channel
             if self._selected_channel_id == channel_id:
                 self._selected_channel_id = "public"
@@ -922,52 +1099,100 @@ class MessagesView(Gtk.Box):
     def _update_thread_title(self, channel_id: str) -> None:
         self._thread_title.set_text(self._get_channel_display_name(channel_id))
 
+    # -- Composer and drafts -------------------------------------------------
+
+    def _sync_composer(self) -> None:
+        """Show the selected thread's own draft and send status in the composer."""
+        channel_id = self._selected_channel_id
+        if channel_id == self._composer_channel_id:
+            return
+        self._composer_channel_id = channel_id
+        self._restoring_draft = True
+        try:
+            self._entry.set_text(self._drafts.get(channel_id))
+        finally:
+            self._restoring_draft = False
+        self._entry.set_position(-1)
+        self._send_status.set_text(self._send_status_by_channel.get(channel_id, ""))
+
+    def _on_entry_changed(self, entry: Gtk.Entry) -> None:
+        if not self._restoring_draft:
+            self._drafts.set(self._composer_channel_id, entry.get_text())
+
+    def _set_send_status(self, channel_id: str, text: str) -> None:
+        """Status of a thread's last send; shown while that thread is open."""
+        self._send_status_by_channel[channel_id] = text
+        if channel_id == self._composer_channel_id:
+            self._send_status.set_text(text)
+
+    def _set_entry_text(self, text: str) -> None:
+        self._restoring_draft = True
+        try:
+            self._entry.set_text(text)
+        finally:
+            self._restoring_draft = False
+
     def _on_send(self, *_args: object) -> None:
-        body = self._entry.get_text().strip()
-        logger.debug(
-            "UI: send clicked channel=%s body_len=%d", self._selected_channel_id, len(body)
-        )
+        # The thread and text are the composer's, captured now: the entry
+        # holds the draft of _composer_channel_id, whatever is selected later.
+        channel_id = self._composer_channel_id
+        body = self._drafts.get(channel_id).strip()
+        logger.debug("UI: send clicked channel=%s body_len=%d", channel_id, len(body))
+        if not activation_allowed(self):
+            return  # Enter held since it sent, or since it opened this page
         if not body:
-            self._send_status.set_text("Enter a message before sending.")
+            self._set_send_status(channel_id, "Enter a message before sending.")
             return
         if self._sending:
+            self._set_send_status(channel_id, "Wait for the last message to finish sending.")
             return
-        channel_id = self._selected_channel_id
+        revision = self._drafts.revision(channel_id)
         display = self._get_channel_display_name(channel_id)
         # A DM waits for its ACK, with retries: up to ~30 s.  Sending on the GTK
         # thread froze the whole UI for that long.
         self._sending = True
-        self._send_button.set_sensitive(False)
-        self._send_status.set_text(f"Sending to {display}...")
+        self._refresh_compose_state()
+        self._set_send_status(channel_id, f"Sending to {display}...")
 
         def work() -> None:
             try:
                 message = self._service.send_message(peer_id=channel_id, body=body)
             except Exception as exc:  # noqa: BLE001
                 logger.error("Send failed: %s", exc)
-                GLib.idle_add(self._on_send_done, body, display, None, str(exc))
+                GLib.idle_add(self._on_send_done, channel_id, revision, display, None, str(exc))
                 return
-            GLib.idle_add(self._on_send_done, body, display, message, None)
+            GLib.idle_add(self._on_send_done, channel_id, revision, display, message, None)
 
         threading.Thread(target=work, daemon=True).start()
 
     def _on_send_done(
-        self, body: str, display: str, message: Message | None, error: str | None
+        self,
+        channel_id: str,
+        revision: int,
+        display: str,
+        message: Message | None,
+        error: str | None,
     ) -> bool:
+        """A send finished; everything here concerns the thread that sent."""
         self._sending = False
         self._refresh_compose_state()
         if message is None:
-            self._send_status.set_text(f"Send failed: {error}")  # the text stays in the entry
+            self._set_send_status(channel_id, f"Send failed: {error}")  # the draft stays
             return False
-        if self._entry.get_text().strip() == body:
-            self._entry.set_text("")
-        self._send_status.set_text(send_status_text(display, message.delivered))
+        # Clear the sent draft unless it was edited meanwhile; another
+        # thread's draft in the entry is not touched.
+        if (
+            self._drafts.clear_if_unchanged(channel_id, revision)
+            and channel_id == self._composer_channel_id
+        ):
+            self._set_entry_text("")
+        self._set_send_status(channel_id, send_status_text(display, message.delivered))
         self._poll_messages()
         return False
 
     def select_dm(self, peer_name: str) -> None:
-        """Open the DM thread with a peer (from the Peers and Map views)."""
-        self.select_channel(self._service.ensure_dm_channel(peer_name).channel_id)
+        """Open a peer's DM from views that call by name."""
+        self.open_dm(self._service.ensure_dm_channel(peer_name).channel_id)
 
     def select_channel(self, channel_id: str) -> None:
         """Select a channel programmatically (for direct messaging from peers view)."""
