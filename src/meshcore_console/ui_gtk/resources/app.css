@@ -102,6 +102,12 @@ row:focus-visible {
   outline-offset: 2px;
 }
 
+/* The map canvas: inset, the map fills its whole allocation */
+map:focus-visible {
+  outline: 2px solid alpha(@mc_accent, 0.8);
+  outline-offset: -2px;
+}
+
 .message-bubble:focus-visible {
   outline: 2px solid alpha(@mc_accent, 0.8);
   outline-offset: 2px;
@@ -560,6 +566,24 @@ button.map-control-button:checked {
 button.map-control-active:hover,
 button.map-control-button:checked:hover {
   background: alpha(@mc_accent, 0.35);
+}
+
+/* GPS status beside My Location: the status pill colours, made opaque so
+   the text stays readable over map tiles */
+.status-pill.map-gps-status {
+  border: 1px solid @mc_border;
+}
+
+.status-pill.map-gps-status.ok {
+  background: mix(@mc_surface, @mc_accent, 0.25);
+}
+
+.status-pill.map-gps-status.warn {
+  background: mix(@mc_surface, @mc_warn, 0.25);
+}
+
+.status-pill.map-gps-status.offline {
+  background: mix(@mc_surface, @mc_danger, 0.3);
 }
 
 .map-details-panel {

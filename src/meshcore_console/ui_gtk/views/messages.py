@@ -1190,10 +1190,6 @@ class MessagesView(Gtk.Box):
         self._poll_messages()
         return False
 
-    def select_dm(self, peer_name: str) -> None:
-        """Open a peer's DM from views that call by name."""
-        self.open_dm(self._service.ensure_dm_channel(peer_name).channel_id)
-
     def select_channel(self, channel_id: str) -> None:
         """Select a channel programmatically (for direct messaging from peers view)."""
         # Ensure the channel exists in the service before trying to select it

@@ -11,7 +11,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import GLib, Gtk, Pango
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 if TYPE_CHECKING:
     pass
@@ -27,8 +27,8 @@ except (ValueError, ImportError):
     SHUMATE_AVAILABLE = False
     print("[MapView] libshumate not available", file=sys.stderr)
 
-from meshcore_console.core.map_view import DEVICE_ZOOM, MAX_ZOOM, initial_view
-from meshcore_console.core.models import Peer
+from meshcore_console.core.map_view import DEVICE_ZOOM, MAX_ZOOM, gps_status_label, initial_view
+from meshcore_console.core.models import Peer, find_peer, peer_identity
 from meshcore_console.core.radio import format_rssi, format_snr
 from meshcore_console.core.services import MeshcoreService
 from meshcore_console.ui_gtk.helpers import clear_children, navigate
@@ -36,8 +36,9 @@ from meshcore_console.ui_gtk.layout import Layout
 from meshcore_console.ui_gtk.state import UiEventStore
 from meshcore_console.core.time import to_local
 from meshcore_console.platform.offline_area import ArchiveCollection, tiles_directory
-from meshcore_console.ui_gtk.widgets import DetailRow, EmptyState
+from meshcore_console.ui_gtk.widgets import DetailRow, EmptyState, StatusPill
 from meshcore_console.ui_gtk.compat import new_toast
+from meshcore_console.ui_gtk.keyboard import focus_within
 
 
 def marker_state(peers: list[Peer]) -> tuple:
@@ -139,6 +140,11 @@ class MapView(Gtk.Box):
         # Get the map widget and viewport
         map_widget = self._map.get_map()
         self._viewport = map_widget.get_viewport()
+        # The canvas is the map's keyboard target (SimpleMap is only its frame)
+        self._map_widget = map_widget
+        map_widget.set_focusable(True)
+        map_widget.set_focus_on_click(True)
+        map_widget.update_property([Gtk.AccessibleProperty.LABEL], ["Map"])
 
         self._archive = self._load_archives()
         settings = self._service.get_settings()
@@ -183,6 +189,13 @@ class MapView(Gtk.Box):
 
         # Add control overlays
         self._add_map_controls(overlay)
+
+        # Arrow keys pan the focused map.  Shumate's own key bindings, where
+        # the installed version has them, handle the keys on the canvas first
+        # and stop them; this only sees the keys they leave unhandled.
+        pan_keys = Gtk.EventControllerKey.new()
+        pan_keys.connect("key-pressed", self._on_map_key)
+        overlay.add_controller(pan_keys)
 
         # Details panel (initially hidden)
         self._details_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -278,8 +291,8 @@ class MapView(Gtk.Box):
 
         self._center_btn = Gtk.Button.new_from_icon_name("find-location-symbolic")
         self._center_btn.add_css_class("map-control-button")
-        self._center_btn.set_tooltip_text("Center on device")
-        self._center_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Center on device"])
+        self._center_btn.set_tooltip_text("My Location: center on this device and follow it")
+        self._center_btn.update_property([Gtk.AccessibleProperty.LABEL], ["My Location"])
         self._center_btn.connect("clicked", self._on_center_device)
         center_box.append(self._center_btn)
 
@@ -288,8 +301,16 @@ class MapView(Gtk.Box):
             move_btn = Gtk.Button.new_from_icon_name("media-skip-forward-symbolic")
             move_btn.add_css_class("map-control-button")
             move_btn.set_tooltip_text("Simulate GPS movement")
+            move_btn.update_property([Gtk.AccessibleProperty.LABEL], ["Simulate GPS movement"])
             move_btn.connect("clicked", self._on_simulate_movement)
             center_box.append(move_btn)
+
+        # GPS status beside My Location: text only, not a Tab stop
+        self._gps_status = StatusPill("", state="offline")
+        self._gps_status.add_css_class("map-gps-status")
+        self._gps_status.set_valign(Gtk.Align.CENTER)
+        center_box.append(self._gps_status)
+        self._update_gps_status()
 
         overlay.add_overlay(center_box)
 
@@ -340,6 +361,40 @@ class MapView(Gtk.Box):
                 self._show_toast("GPS location unavailable")
             else:
                 self._show_toast("GPS acquiring satellites...")
+
+    # Fraction of the map's width/height one arrow key press pans
+    _PAN_STEP = 0.2
+
+    def _on_map_key(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        """Pan with the arrow keys while the map canvas has the focus.
+
+        Not a programmatic move: like a drag, it ends follow mode."""
+        steps = {
+            Gdk.KEY_Left: (-1, 0),
+            Gdk.KEY_Right: (1, 0),
+            Gdk.KEY_Up: (0, -1),
+            Gdk.KEY_Down: (0, 1),
+        }
+        step = steps.get(keyval)
+        if step is None or state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK):
+            return False
+        root = self.get_root()
+        if root is None or root.get_focus() is not self._map_widget:
+            return False  # a button's arrow keys move between the controls
+        width, height = self._map_widget.get_width(), self._map_widget.get_height()
+        if width <= 0 or height <= 0:
+            return False
+        x = width / 2 + step[0] * width * self._PAN_STEP
+        y = height / 2 + step[1] * height * self._PAN_STEP
+        lat, lon = self._viewport.widget_coords_to_location(self._map_widget, x, y)
+        self._viewport.set_location(lat, lon)
+        return True
 
     def _on_viewport_moved(self, viewport: object, pspec: object) -> None:
         """Disable follow mode when user pans the map."""
@@ -539,8 +594,17 @@ class MapView(Gtk.Box):
         """Poll GPS for new data (serial port). GLib timeout callback."""
         self._service.poll_gps()
         self._check_gps_status()
+        self._update_gps_status()
         self._update_device_marker()
         return True
+
+    def _update_gps_status(self) -> None:
+        """The status beside My Location: fix, no fix, unavailable, fixed location."""
+        text, pill = gps_status_label(self._service.get_gps_state())
+        if self._gps_status.get_text() != text:
+            logger.debug("UI: map GPS status %r", text)
+            self._gps_status.set_text(text)
+            self._gps_status.set_state(pill)
 
     def _check_gps_status(self) -> None:
         """Check GPS status and show toast for errors."""
@@ -834,22 +898,38 @@ class MapView(Gtk.Box):
     def close_active_detail(self) -> bool:
         """Close the details panel if open. Returns True if something was closed."""
         if hasattr(self, "_details_panel") and self._details_panel.get_visible():
-            self._selected_peer = None
-            self._details_panel.set_visible(False)
+            self._hide_details()
             return True
         return False
 
+    def _hide_details(self) -> None:
+        had_focus = focus_within(self._details_panel)
+        self._selected_peer = None
+        self._details_panel.set_visible(False)
+        if had_focus:
+            self._map_widget.grab_focus()  # the focus went with the panel
+
     def get_default_focus(self) -> Gtk.Widget:
-        """Return the widget that should receive focus when this view is shown."""
-        if hasattr(self, "_map"):
-            return self._map
+        """Return the widget that should receive focus when this view is shown:
+        the map canvas, where the arrow keys pan."""
+        if hasattr(self, "_map_widget"):
+            return self._map_widget
         return self
 
     def _on_close_details(self, _button: Gtk.Button) -> None:
         """Close the details panel."""
-        self._selected_peer = None
-        self._details_panel.set_visible(False)
+        self._hide_details()
 
     def _on_send_message_clicked(self, _button: Gtk.Button, peer: Peer) -> None:
-        """Navigate to messages view and start a conversation with this peer."""
-        navigate(self, "messages", ("select_dm", peer.display_name))
+        """Open the DM thread with this peer in Messages, ready to compose.
+
+        Resolved by the peer's identity now: the marker was built with the
+        peer as it was then, and its name may since belong to somebody else.
+        """
+        current = find_peer(self._service.list_peers(), peer_identity(peer))
+        if current is None:
+            return
+        channel = self._service.ensure_dm_channel(
+            current.display_name, public_key=current.public_key
+        )
+        navigate(self, "messages", ("open_dm", channel.channel_id))
