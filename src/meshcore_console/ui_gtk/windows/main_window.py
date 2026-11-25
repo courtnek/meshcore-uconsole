@@ -27,6 +27,7 @@ from meshcore_console.ui_gtk.compat import (
     new_toast,
     present_dialog,
 )
+from meshcore_console.ui_gtk.keyboard import ActivationLatch, focus_is_lost, focus_within
 from meshcore_console.ui_gtk.state import UiEventStore
 from meshcore_console.ui_gtk.widgets import ConflictScreen, LoadingScreen, StatusPill
 
@@ -47,6 +48,16 @@ class MainWindow(Adw.ApplicationWindow):
         self._surface_debug_wired = False
         self._shutting_down = False
         self._radio_error_badge_id = 0
+        # One radio action (or send) per press of Enter/Space, however long it is held
+        self.activation_latch = ActivationLatch()
+        self.activation_latch.attach(self)
+        self.connect("notify::is-active", self._on_active_changed)
+        self._radio_focus_origin: Gtk.Widget | None = None
+        # A Connect/Disconnect the user started is pending: give the focus back
+        # when it finishes.  Not after autoconnect, which nobody pressed: the
+        # focus would land on Disconnect, a stray Enter away from going offline.
+        self._radio_focus_pending = False
+        self._focus_view_id = 0  # a pending _focus_current_view
         self.set_title("Meshcore Console")
         self._apply_window_geometry()
         self.add_css_class("app-root")
@@ -180,7 +191,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._connect_button = Gtk.Button.new_with_label(
             "Disconnect" if status.connected else "Connect"
         )
-        self._connect_button.connect("clicked", self._on_connect_toggle)
+        self._connect_button.connect("clicked", self._on_connect_clicked)
         header_bar.pack_end(self._connect_button)
 
         settings_btn = Gtk.Button.new_from_icon_name("emblem-system-symbolic")
@@ -213,6 +224,11 @@ class MainWindow(Adw.ApplicationWindow):
         advert_box.append(discover_btn)
         self._discovering = False
         advert_popover.set_child(advert_box)
+        # The popover is a surface of its own: watch its keys too, and let the
+        # Enter that opened it not choose an advert by repeating.
+        self.activation_latch.attach(advert_popover)
+        advert_popover.connect("show", lambda _p: self.activation_latch.latch())
+        advert_popover.connect("closed", self._on_advert_popover_closed)
         self._advert_btn.set_popover(advert_popover)
         header_bar.pack_end(self._advert_btn)
 
@@ -300,9 +316,13 @@ class MainWindow(Adw.ApplicationWindow):
         elif page_name in self._nav_buttons:
             for name, btn in self._nav_buttons.items():
                 btn.set_active(name == page_name)
+        # An Enter that switched pages must not go on to act on the new page
+        # (e.g. send the draft in the message entry) by repeating.
+        self.activation_latch.latch()
         self._switch_to_page(page_name)
         self._focus_current_view()
-        # Call target method if requested
+        # Call target method if requested (before the focus moves, which
+        # happens on idle, so the view can choose where the focus goes)
         if then is not None:
             method_name, arg = then
             view = self._stack.get_child_by_name(page_name)
@@ -318,6 +338,7 @@ class MainWindow(Adw.ApplicationWindow):
             for name, btn in self._nav_buttons.items():
                 if name != page_name:
                     btn.set_active(False)
+            self.activation_latch.latch()
             self._switch_to_page(page_name)
             self._focus_current_view()
         elif all(not btn.get_active() for btn in self._nav_buttons.values()):
@@ -329,21 +350,39 @@ class MainWindow(Adw.ApplicationWindow):
         # Deactivate all nav buttons when showing settings
         for btn in self._nav_buttons.values():
             btn.set_active(False)
+        self.activation_latch.latch()
         self._switch_to_page("settings")
         self._focus_current_view()
 
     def _on_advert_flood(self, _button: Gtk.Button, popover: Gtk.Popover) -> None:
         logger.debug("UI: flood advert button clicked")
+        if not self.activation_latch.begin():
+            return  # a held key repeating
         popover.popdown()
         self._send_advert(route_type="flood")
 
     def _on_advert_direct(self, _button: Gtk.Button, popover: Gtk.Popover) -> None:
         logger.debug("UI: direct advert button clicked")
+        if not self.activation_latch.begin():
+            return
         popover.popdown()
         self._send_advert(route_type="direct")
 
+    def _on_advert_popover_closed(self, _popover: Gtk.Popover) -> None:
+        """Give the focus back to the header once the advert menu closes."""
+
+        def restore() -> bool:
+            if focus_is_lost(self):
+                target = self._advert_btn if self._advert_btn.is_sensitive() else None
+                (target or self._connect_button).grab_focus()
+            return False
+
+        GLib.idle_add(restore)
+
     def _on_discover(self, _button: Gtk.Button, popover: Gtk.Popover) -> None:
         logger.debug("UI: discover button clicked")
+        if not self.activation_latch.begin():
+            return
         popover.popdown()
         if self._discovering:
             self._toast_overlay.add_toast(new_toast("Discover is still listening"))
@@ -545,7 +584,16 @@ class MainWindow(Adw.ApplicationWindow):
         threading.Thread(target=do_connect, daemon=True).start()
         return False  # Don't repeat idle callback
 
+    def _on_connect_clicked(self, button: Gtk.Button) -> None:
+        if not self.activation_latch.begin():
+            return  # Enter held since the last connect/disconnect
+        self._on_connect_toggle(button)
+
     def _on_connect_toggle(self, _button: Gtk.Button) -> None:
+        # Disabling the button below takes the focus from it; remember where
+        # it was to give it back when the radio has answered.
+        self._radio_focus_origin = self.get_focus()
+        self._radio_focus_pending = True
         # Use button label to determine action (avoids state sync issues)
         current_label = self._connect_button.get_label()
         is_disconnect = current_label == "Disconnect"
@@ -594,7 +642,33 @@ class MainWindow(Adw.ApplicationWindow):
             logger.debug("UI: toast '%s'", msg)
             self._toast_overlay.add_toast(new_toast(msg))
         self._refresh_connection_state()
+        self._restore_radio_focus()
         return False  # Don't repeat
+
+    def _restore_radio_focus(self) -> None:
+        """Put the focus back after Connect/Disconnect finished.
+
+        The pending button was disabled, which dropped the focus.  If the user
+        moved the focus meanwhile, it stays where they put it.  Only for a
+        toggle the user started (Connect, or Retry on the conflict screen).
+        """
+        origin, self._radio_focus_origin = self._radio_focus_origin, None
+        pending, self._radio_focus_pending = self._radio_focus_pending, False
+        if not pending:
+            return  # autoconnect: nobody pressed anything
+        if self._content_stack.get_visible_child_name() != "main":
+            return  # the conflict screen took over
+        if not focus_is_lost(self):
+            return
+        if (
+            origin is not None
+            and origin is not self._connect_button
+            and origin.get_mapped()
+            and origin.is_sensitive()
+        ):
+            origin.grab_focus()
+        else:
+            self._connect_button.grab_focus()
 
     # ------------------------------------------------------------------
     # Conflict screen
@@ -760,7 +834,10 @@ class MainWindow(Adw.ApplicationWindow):
             "ok" if status.connected else "offline",
         )
         self._connect_button.set_label("Disconnect" if status.connected else "Connect")
+        advert_had_focus = focus_within(self._advert_btn)
         self._advert_btn.set_sensitive(status.connected)
+        if advert_had_focus and not status.connected and self._connect_button.is_sensitive():
+            self._connect_button.grab_focus()  # the next control in the header
         self._subtitle.set_text(self._subtitle_text(status.node_id))
         # Refresh the settings public key (only available after connect)
         settings_widget = self._stack.get_child_by_name("settings")
@@ -810,11 +887,19 @@ class MainWindow(Adw.ApplicationWindow):
         _keycode: int,
         state: Gdk.ModifierType,
     ) -> bool:
-        # Escape: close active detail panel in the current view
+        # Escape: close the view's open detail first, then let the view move
+        # the focus back out (e.g. from the composer to the channel list).
+        # Popovers, input methods and the focused widget have seen the key
+        # before this (bubble phase) and kept it if it was theirs.
         if keyval == Gdk.KEY_Escape:
+            if self._dialog_visible():
+                return False
             view = self._stack.get_visible_child()
             close_fn = getattr(view, "close_active_detail", None)
             if close_fn is not None and close_fn():
+                return True
+            escape_fn = getattr(view, "escape_focus", None)
+            if escape_fn is not None and escape_fn():
                 return True
             return False
 
@@ -834,30 +919,53 @@ class MainWindow(Adw.ApplicationWindow):
             return False
 
         logger.debug("UI: keyboard shortcut Ctrl+%s → %s", keyval - Gdk.KEY_0, page)
-        self._switch_to_page(page)
-        # Update nav button states
-        if page == "settings":
-            for btn in self._nav_buttons.values():
-                btn.set_active(False)
-        elif page in self._nav_buttons:
-            for name, btn in self._nav_buttons.items():
-                btn.set_active(name == page)
-        self._focus_current_view()
+        # navigate_to sets the nav buttons before switching, so the toggle
+        # handlers can't switch the page back
+        self.navigate_to(page)
         return True
 
+    def _dialog_visible(self) -> bool:
+        """True while an in-window dialog (libadwaita >= 1.5) is open; it handles its own Esc."""
+        get_dialog = getattr(self, "get_visible_dialog", None)
+        return get_dialog is not None and get_dialog() is not None
+
+    def _on_active_changed(self, _window: Gtk.Window, _pspec: object) -> None:
+        # Key releases made in another window never reach this one
+        if not self.is_active():
+            self.activation_latch.reset()
+
+    def focus_header(self) -> bool:
+        """Focus the first usable radio control in the header (for views
+        whose own Tab order ends with nothing focusable)."""
+        for widget in (self._connect_button, self._advert_btn):
+            if widget.is_sensitive() and widget.grab_focus():
+                return True
+        return False
+
     def _focus_current_view(self) -> None:
-        """Move focus to the default widget in the current view after transition."""
+        """Move focus to the default widget in the current view after transition.
+
+        One pending focus at a time: a page switch through navigate_to also
+        toggles a nav button, which asks again, and a second run would undo
+        the first's choice (the composer after Send Message)."""
+        if self._focus_view_id:
+            return
 
         def do_focus() -> bool:
+            self._focus_view_id = 0
             view = self._stack.get_visible_child()
             focus_fn = getattr(view, "get_default_focus", None)
             if focus_fn is not None:
                 target = focus_fn()
-                if target is not None:
+                if isinstance(target, Gtk.Entry):
+                    # a restored draft: keep the cursor, don't select it all
+                    # (the next key would replace it)
+                    target.grab_focus_without_selecting()
+                elif target is not None:
                     target.grab_focus()
             return False  # GLib.SOURCE_REMOVE
 
-        GLib.idle_add(do_focus)
+        self._focus_view_id = GLib.idle_add(do_focus)
 
     @staticmethod
     def _subtitle_text(node_id: str) -> str:
