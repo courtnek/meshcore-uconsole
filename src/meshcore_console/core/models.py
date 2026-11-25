@@ -64,6 +64,22 @@ class Peer:
     is_favorite: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class GpsState:
+    """What the GPS is doing, as the map's status shows it.
+
+    ``fix``: the receiver reports a usable current fix (and a position).
+    ``available``: a receiver is configured and reachable; False when there
+    is none, or it can't be opened or reached.
+    ``manual``: the device position comes from the configured fixed
+    location, not from the receiver.
+    """
+
+    available: bool
+    fix: bool
+    manual: bool = False
+
+
 @dataclass(slots=True)
 class Message:
     message_id: str

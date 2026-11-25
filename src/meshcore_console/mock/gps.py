@@ -22,6 +22,8 @@ class MockGps:
         self._running = False
         self._position_index = 0
         self._positions = positions if positions is not None else list(MOCK_GPS_WAYPOINTS)
+        self._fix = True
+        self._available = True
 
     def start(self) -> None:
         self._running = True
@@ -31,7 +33,7 @@ class MockGps:
         self._running = False
 
     def get_location(self) -> tuple[float, float] | None:
-        if not self._running:
+        if not self.has_fix():
             return None
         return self._positions[self._position_index]
 
@@ -60,8 +62,19 @@ class MockGps:
         return None
 
     def has_fix(self) -> bool:
-        """Mock GPS always has a fix when running."""
-        return self._running
+        """Mock GPS has a fix when running, unless set_fix/set_available took it."""
+        return self._running and self._available and self._fix
+
+    def is_available(self) -> bool:
+        return self._available
+
+    def set_fix(self, fix: bool) -> None:
+        """Simulate gaining or losing the satellite fix (receiver still there)."""
+        self._fix = fix
+
+    def set_available(self, available: bool) -> None:
+        """Simulate the receiver going missing (or coming back)."""
+        self._available = available
 
     def set_positions(self, positions: list[tuple[float, float]]) -> None:
         """Set custom positions for testing."""

@@ -32,6 +32,18 @@ def _nmea_to_decimal(coord: str, direction: str, is_longitude: bool = False) -> 
     return result
 
 
+def _gga_has_fix(sentence: str) -> bool:
+    """GGA field 6, the fix quality: 0 (or missing) is no fix."""
+    parts = sentence.split(",")
+    return len(parts) > 6 and parts[6].isdigit() and int(parts[6]) > 0
+
+
+def _rmc_has_fix(sentence: str) -> bool:
+    """RMC field 2, the status: A is valid, V (void) is no fix."""
+    parts = sentence.split(",")
+    return len(parts) > 2 and parts[2] == "A"
+
+
 class GpsProvider(Protocol):
     """Protocol for GPS providers."""
 
@@ -63,6 +75,11 @@ class GpsProvider(Protocol):
         """Return True if GPS has acquired a satellite fix."""
         ...
 
+    def is_available(self) -> bool:
+        """False when there is no receiver, or it explicitly can't be used
+        (port won't open, gpsd unreachable).  Waiting for a fix is available."""
+        ...
+
 
 class UConsoleGps:
     """GPS provider for uConsole AIO board.
@@ -77,6 +94,7 @@ class UConsoleGps:
     GPIO_ENABLE_PIN = 27
     SERIAL_PORT = "/dev/ttyS0"  # Default; see GPS_SERIAL_CANDIDATES
     BAUD_RATE = 9600
+    MAX_EMPTY_READS = 3
 
     def __init__(self, serial_port: str | None = None) -> None:
         self._serial_port = serial_port or self.SERIAL_PORT
@@ -92,8 +110,10 @@ class UConsoleGps:
         self._has_fix = False
         self._last_fix_quality = 0
         self._last_num_sats = 0
+        self._empty_reads = 0
         self._sats_in_view = 0
         self._last_status_log_count = 0
+        self._port_failed = False  # the serial port could not be opened or read
 
     def start(self) -> None:
         if self._running:
@@ -123,18 +143,24 @@ class UConsoleGps:
                 timeout=1.0,
             )
             self._running = True
+            self._port_failed = False
+            self._empty_reads = 0
             logger.debug("GPS: opened %s at %d baud", self._serial_port, self.BAUD_RATE)
         except ImportError:
+            self._port_failed = True
             self._report_error("pyserial not installed - GPS unavailable")
         except PermissionError:
+            self._port_failed = True
             self._report_error(
                 f"Permission denied on {self._serial_port} - add user to dialout group"
             )
         except OSError as e:
+            self._port_failed = True
             self._report_error(f"Serial port error: {e}")
 
     def stop(self) -> None:
         self._running = False
+        self._lose_fix()
 
         # Close serial port
         if self._serial is not None:
@@ -150,11 +176,20 @@ class UConsoleGps:
         self._gpio_enabled = False
 
     def get_location(self) -> tuple[float, float] | None:
-        if not self._running:
+        # Only a current fix, as GpsdProvider: the last position is not where
+        # the device is once the fix (or the receiver) is lost.
+        if not self._running or not self._has_fix:
             return None
         if self._latitude is not None and self._longitude is not None:
             return (self._latitude, self._longitude)
         return None
+
+    def _lose_fix(self) -> None:
+        """No current fix: forget the position with it."""
+        if self._has_fix:
+            logger.info("GPS: fix lost")
+        self._has_fix = False
+        self._latitude = self._longitude = None
 
     def set_callback(self, callback: Callable[[float, float], None] | None) -> None:
         self._callback = callback
@@ -170,6 +205,11 @@ class UConsoleGps:
     def has_fix(self) -> bool:
         """Return True if GPS has acquired a fix."""
         return self._has_fix
+
+    def is_available(self) -> bool:
+        """The port opened and reads.  "No data" and "waiting for a fix" are
+        reported as errors too, but the receiver is there."""
+        return not self._port_failed
 
     def _report_error(self, message: str) -> None:
         """Report an error via callback and store it."""
@@ -216,12 +256,18 @@ class UConsoleGps:
 
         try:
             line = self._serial.readline()  # type: ignore[union-attr]
+            self._port_failed = False
             if not line:
+                # A quiet port can still be open after the receiver stops.
+                self._empty_reads += 1
+                if self._empty_reads >= self.MAX_EMPTY_READS:
+                    self._lose_fix()
                 # No data received - check if this is persistent
                 if self._poll_count == 15:  # ~30 seconds with 2s poll interval
                     self._report_error("No GPS data received - check serial connection")
                 return True
 
+            self._empty_reads = 0
             sentence = line.decode("ascii", errors="ignore").strip()
             if not sentence:
                 return True
@@ -234,12 +280,20 @@ class UConsoleGps:
                 self._logged_sentences.add(sentence_type)
                 logger.debug("GPS: receiving NMEA: %s", sentence_type)
 
+            # A sentence that reports no fix ends the fix, even if it still
+            # carries the last position (receivers send one); parse only valid ones.
             if sentence.startswith("$GNGGA") or sentence.startswith("$GPGGA"):
                 self._log_gga_status(sentence)
-                self._parse_gga(sentence)
+                if _gga_has_fix(sentence):
+                    self._parse_gga(sentence)
+                else:
+                    self._lose_fix()
             elif sentence.startswith("$GNRMC") or sentence.startswith("$GPRMC"):
                 self._log_rmc_status(sentence)
-                self._parse_rmc(sentence)
+                if _rmc_has_fix(sentence):
+                    self._parse_rmc(sentence)
+                else:
+                    self._lose_fix()
             elif (
                 sentence.startswith("$GPGSV")
                 or sentence.startswith("$GLGSV")
@@ -251,7 +305,11 @@ class UConsoleGps:
             if self._poll_count == 30 and not self._has_fix:  # ~60 seconds
                 self._report_error("GPS acquiring satellites - waiting for fix")
 
-        except (OSError, UnicodeDecodeError) as e:
+        except OSError as e:
+            self._port_failed = True  # e.g. a USB receiver unplugged
+            self._lose_fix()
+            self._report_error(f"GPS read error: {e}")
+        except UnicodeDecodeError as e:
             self._report_error(f"GPS read error: {e}")
 
         return True
@@ -422,6 +480,8 @@ class GpsdProvider:
         self._has_fix = False
         self._last_error: str | None = None
         self._thread: threading.Thread | None = None
+        # gpsd answered when the provider was chosen; False while it can't be reached
+        self._reachable = True
 
     def start(self) -> None:
         if self._running:
@@ -456,6 +516,9 @@ class GpsdProvider:
     def has_fix(self) -> bool:
         return self._has_fix
 
+    def is_available(self) -> bool:
+        return self._reachable
+
     def _update_location(self, lat: float, lon: float) -> None:
         if lat == 0.0 and lon == 0.0:
             return
@@ -478,6 +541,7 @@ class GpsdProvider:
                 logger.debug("GpsdProvider: connecting to %s:%d", self._host, self._port)
                 with GPSDClient(host=self._host, port=self._port) as client:
                     backoff = 1.0  # Reset on successful connection
+                    self._reachable = True
                     for result in client.dict_stream(filter=["TPV"]):
                         if not self._running:
                             return
@@ -491,20 +555,29 @@ class GpsdProvider:
                         lon = result.get("lon")
                         if lat is not None and lon is not None:
                             self._update_location(float(lat), float(lon))
+                # The stream ended without an error: gpsd closed the connection
+                # (restart, shutdown).  Its fix ended with it.
+                if not self._running:
+                    return
+                reason = "gpsd closed the connection"
             except Exception as e:
                 if not self._running:
                     return
-                self._has_fix = False  # no gpsd, no current position
-                self._last_error = f"gpsd connection error: {e}"
-                logger.warning("GpsdProvider: %s (retry in %.0fs)", e, backoff)
-                # Sleep in small increments so we can check _running
-                elapsed = 0.0
-                while elapsed < backoff and self._running:
-                    import time
+                self._reachable = False
+                reason = f"gpsd connection error: {e}"
+            self._has_fix = False  # no gpsd stream, no current position
+            self._last_error = reason
+            logger.warning("GpsdProvider: %s (retry in %.0fs)", reason, backoff)
+            # Back off before reconnecting (after a close too: a gpsd that
+            # accepts and closes at once would be retried in a busy loop).
+            # Sleep in small increments so we can check _running
+            elapsed = 0.0
+            while elapsed < backoff and self._running:
+                import time
 
-                    time.sleep(min(0.5, backoff - elapsed))
-                    elapsed += 0.5
-                backoff = min(backoff * 2, max_backoff)
+                time.sleep(min(0.5, backoff - elapsed))
+                elapsed += 0.5
+            backoff = min(backoff * 2, max_backoff)
 
 
 def _gpsd_available(host: str = "127.0.0.1", port: int = 2947) -> bool:
@@ -539,6 +612,9 @@ class NullGps:
 
     def has_fix(self) -> bool:
         return False
+
+    def is_available(self) -> bool:
+        return False  # no receiver configured or detected
 
 
 # Serial ports probed when no explicit device is configured. /dev/ttyS0 is
