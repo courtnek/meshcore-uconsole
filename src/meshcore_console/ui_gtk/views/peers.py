@@ -7,15 +7,16 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import GLib, Gtk, Pango
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 if TYPE_CHECKING:
     pass
 
-from meshcore_console.core.models import Peer
+from meshcore_console.core.models import Peer, find_peer, peer_identity
 from meshcore_console.core.radio import format_rssi, format_snr
 from meshcore_console.core.services import MeshcoreService
 from meshcore_console.ui_gtk.helpers import clear_children, clear_listbox, navigate
+from meshcore_console.ui_gtk.keyboard import activation_allowed, focus_within, single_tab_list_box
 from meshcore_console.ui_gtk.layout import Layout
 from meshcore_console.ui_gtk.state import UiEventStore
 from meshcore_console.core.time import to_local
@@ -75,7 +76,7 @@ class PeersView(Gtk.Box):
         contacts_scroll.set_vexpand(True)
         contacts_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
-        self._contacts_list = Gtk.ListBox.new()
+        self._contacts_list = single_tab_list_box()
         self._contacts_list.add_css_class("peer-list")
         self._contacts_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self._contacts_list.connect("row-selected", self._on_peer_selected)
@@ -101,7 +102,7 @@ class PeersView(Gtk.Box):
         network_scroll.set_vexpand(True)
         network_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
 
-        self._network_list = Gtk.ListBox.new()
+        self._network_list = single_tab_list_box()
         self._network_list.add_css_class("peer-list")
         self._network_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self._network_list.connect("row-selected", self._on_peer_selected)
@@ -137,9 +138,50 @@ class PeersView(Gtk.Box):
 
         self.append(details_column)
 
+        keys = Gtk.EventControllerKey.new()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_peer_key)
+        self.add_controller(keys)
+
         self._show_empty_details()
         self._refresh_peers()
         self._event_store.connect("events-available", lambda _store: self._poll_peers())
+
+    def _on_peer_key(
+        self,
+        _controller: Gtk.EventControllerKey,
+        keyval: int,
+        _keycode: int,
+        state: Gdk.ModifierType,
+    ) -> bool:
+        if state & (
+            Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK
+        ):
+            return False
+
+        in_contacts = focus_within(self._contacts_list)
+        in_repeaters = focus_within(self._network_list)
+        if in_contacts and keyval == Gdk.KEY_Right:
+            return self._network_list.child_focus(Gtk.DirectionType.TAB_FORWARD)
+        if in_repeaters and keyval == Gdk.KEY_Left:
+            return self._contacts_list.child_focus(Gtk.DirectionType.TAB_FORWARD)
+
+        if keyval not in (Gdk.KEY_Tab, Gdk.KEY_KP_Tab, Gdk.KEY_ISO_Left_Tab):
+            return False
+        selected = self._selected_peer
+        if selected is None:
+            return False
+        backward = keyval == Gdk.KEY_ISO_Left_Tab or bool(state & Gdk.ModifierType.SHIFT_MASK)
+        if not backward and (in_contacts or in_repeaters):
+            # Entering the other list selects its first row. Go to the
+            # chosen peer's details so Tab can't change the action target.
+            return self._details_scroll.child_focus(Gtk.DirectionType.TAB_FORWARD)
+        if backward and focus_within(self._details_scroll):
+            if self._details_scroll.child_focus(Gtk.DirectionType.TAB_BACKWARD):
+                return True
+            row = self._row_for(peer_identity(selected))
+            return row is not None and row.grab_focus()
+        return False
 
     @staticmethod
     def _peer_snapshot(peers: list[Peer]) -> str:
@@ -167,45 +209,93 @@ class PeersView(Gtk.Box):
         re-render the details panel (scroll jumped to the top, an in-flight
         telemetry request lost its spinner and the button re-armed, inviting
         duplicate requests) and move keyboard focus to another row.
+
+        Selection and focus follow the peer (``peer_identity``), not the row
+        position: an advert reorders the list, and the row that was at the
+        focused position is then somebody else.
         """
-        selected_name = self._selected_peer.display_name if self._selected_peer else None
-        focus_list, focus_index = self._focused_row()
+        selected_key = peer_identity(self._selected_peer) if self._selected_peer else None
+        focus_list, focus_key = self._focused_row()
         self._refreshing = True
         try:
-            self._rebuild_lists(selected_name)
+            self._rebuild_lists(selected_key)
         finally:
             self._refreshing = False
         # The new rows aren't mapped until the next frame, so restore focus
         # (and undo the selection GTK makes when focus falls back to the list)
         # once they are.
-        GLib.idle_add(self._restore_focus, selected_name is None, focus_list, focus_index)
+        GLib.idle_add(self._restore_focus, selected_key, focus_list, focus_key)
 
     def _restore_focus(
-        self, had_no_selection: bool, focus_list: Gtk.ListBox | None, focus_index: int
+        self,
+        selected_key: str | None,
+        focus_list: Gtk.ListBox | None,
+        focus_key: str | None,
     ) -> bool:
-        if focus_list is not None:
-            row = focus_list.get_row_at_index(focus_index)
-            if row is not None:
-                row.grab_focus()
-        if had_no_selection:
-            self._refreshing = True  # a rebuild must not select anything by itself
-            try:
-                for listbox in (self._contacts_list, self._network_list):
+        target = self._row_for(selected_key) if selected_key else None
+        self._refreshing = True  # a rebuild must not select anything by itself
+        try:
+            if focus_list is not None:
+                row = self._row_for(focus_key) if focus_key else None
+                if row is None and target is not None and target.get_parent() is focus_list:
+                    row = target  # the focused peer is gone: back to the selection
+                if row is not None:
+                    row.grab_focus()
+                elif not focus_list.grab_focus():
+                    first = focus_list.get_row_at_index(0)
+                    if first is not None:
+                        first.grab_focus()
+            # The selection is the action target: exactly the peer it was
+            for listbox in (self._contacts_list, self._network_list):
+                if target is None or target.get_parent() is not listbox:
                     listbox.unselect_all()
-            finally:
-                self._refreshing = False
+            if target is not None and not target.is_selected():
+                parent = target.get_parent()
+                if isinstance(parent, Gtk.ListBox):
+                    parent.select_row(target)
+        finally:
+            self._refreshing = False
+        if (
+            target is None
+            and selected_key is not None
+            and self._selected_peer is not None
+            and peer_identity(self._selected_peer) == selected_key
+        ):
+            # The selected peer left the list.  Drop it rather than let its
+            # buttons (or GTK's fallback selection) act on somebody else.
+            logger.debug("UI: selected peer left the list")
+            self._selected_peer = None
+            self._show_empty_details()
         return False
 
-    def _focused_row(self) -> tuple[Gtk.ListBox | None, int]:
+    def _focused_row(self) -> tuple[Gtk.ListBox | None, str | None]:
         root = self.get_root()
         focus = root.get_focus() if root is not None else None
         if isinstance(focus, Gtk.ListBoxRow):
             for listbox in (self._contacts_list, self._network_list):
                 if focus.get_parent() is listbox:
-                    return listbox, focus.get_index()
-        return None, -1
+                    peer = getattr(focus, "peer", None)
+                    return listbox, peer_identity(peer) if peer is not None else None
+        return None, None
 
-    def _rebuild_lists(self, selected_name: str | None) -> None:
+    def _row_for(self, identity: str) -> Gtk.ListBoxRow | None:
+        """The row showing the peer with ``identity``, in either list."""
+        for listbox in (self._contacts_list, self._network_list):
+            index = 0
+            while (row := listbox.get_row_at_index(index)) is not None:
+                peer = getattr(row, "peer", None)
+                if peer is not None and peer_identity(peer) == identity:
+                    return row
+                index += 1
+        return None
+
+    def _current_peer(self, peer: Peer) -> Peer | None:
+        """The service's current record of ``peer``, looked up by identity
+        when an action runs: the details may show a stale copy (renamed since,
+        or gone)."""
+        return find_peer(self._service.list_peers(), peer_identity(peer))
+
+    def _rebuild_lists(self, selected_key: str | None) -> None:
         # Clear existing rows
         for listbox in (self._contacts_list, self._network_list):
             clear_listbox(listbox)
@@ -228,8 +318,12 @@ class PeersView(Gtk.Box):
         self._populate_list(self._network_list, network, "No repeaters yet")
 
         # Restore selection
-        if selected_name:
-            self._reselect_peer(selected_name)
+        if selected_key:
+            row = self._row_for(selected_key)
+            if row is not None:
+                parent = row.get_parent()
+                if isinstance(parent, Gtk.ListBox):
+                    parent.select_row(row)
 
     def _populate_list(self, listbox: Gtk.ListBox, peers: list[Peer], empty_msg: str) -> None:
         """Populate a listbox with peers."""
@@ -250,7 +344,7 @@ class PeersView(Gtk.Box):
             # pick up the fresh Peer object for the same selection.
             peer = getattr(row, "peer", None) if row is not None else None
             if peer is not None and self._selected_peer is not None:
-                if peer.display_name == self._selected_peer.display_name:
+                if peer_identity(peer) == peer_identity(self._selected_peer):
                     self._selected_peer = peer
             return
         # Deselect the other list
@@ -273,7 +367,12 @@ class PeersView(Gtk.Box):
         self._show_peer_details(peer)
 
     def get_default_focus(self) -> Gtk.Widget:
-        """Return the widget that should receive focus when this view is shown."""
+        """Return the widget that should receive focus when this view is shown:
+        the selected peer's row, so browsing continues where it was."""
+        if self._selected_peer is not None:
+            row = self._row_for(peer_identity(self._selected_peer))
+            if row is not None:
+                return row
         return self._contacts_list
 
     def _show_empty_details(self) -> None:
@@ -380,8 +479,14 @@ class PeersView(Gtk.Box):
             self._render_telemetry(cached)
 
         # === Action buttons === (wrap rather than widen the window)
+        # Each FlowBox child is one tab stop, the arrow keys move between them
+        # and Enter runs the button inside (child-activated).  Focusable
+        # buttons inside focusable children made two stops per action, and
+        # Enter on the child did nothing.
         actions = Gtk.FlowBox()
         actions.set_selection_mode(Gtk.SelectionMode.NONE)
+        actions.add_css_class("peer-actions")
+        actions.connect("child-activated", self._on_action_child_activated)
         actions.set_column_spacing(8)
         actions.set_row_spacing(8)
         actions.set_max_children_per_line(3)
@@ -402,7 +507,23 @@ class PeersView(Gtk.Box):
         telem_btn.connect("clicked", self._on_request_telemetry_clicked, peer)
         actions.append(telem_btn)
 
+        child = actions.get_first_child()
+        while child is not None:
+            button = child.get_first_child() if isinstance(child, Gtk.FlowBoxChild) else None
+            if isinstance(button, Gtk.Button):
+                button.set_focusable(False)  # the FlowBox child holds the focus
+            child = child.get_next_sibling()
+
         self._details_content.append(actions)
+
+    @staticmethod
+    def _on_action_child_activated(flowbox: Gtk.FlowBox, child: Gtk.FlowBoxChild) -> None:
+        button = child.get_child()
+        if not isinstance(button, Gtk.Button) or not button.is_sensitive():
+            return
+        if not activation_allowed(flowbox):
+            return  # Enter held: one favorite toggle, one request
+        button.emit("clicked")
 
     def _add_section_header(self, title: str) -> None:
         """Add a section header to the details panel."""
@@ -426,36 +547,41 @@ class PeersView(Gtk.Box):
                     return
                 index += 1
 
-    def _reselect_peer(self, display_name: str) -> None:
-        """Re-select a peer by name after a list refresh."""
-        for listbox in (self._contacts_list, self._network_list):
-            index = 0
-            while True:
-                row = listbox.get_row_at_index(index)
-                if row is None:
-                    break
-                peer = getattr(row, "peer", None)
-                if peer and peer.display_name == display_name:
-                    listbox.select_row(row)
-                    return
-                index += 1
-
     def _on_toggle_favorite_clicked(self, _button: Gtk.Button, peer: Peer) -> None:
         """Toggle the favorite status of a peer."""
+        current = self._current_peer(peer)
+        if current is None:
+            return
         logger.debug(
-            "UI: toggle favorite peer=%s currently=%s", peer.display_name, peer.is_favorite
+            "UI: toggle favorite peer=%s currently=%s", current.display_name, current.is_favorite
         )
-        self._service.set_favorite(peer.peer_id, not peer.is_favorite)
+        self._service.set_favorite(current.peer_id, not current.is_favorite)
         GLib.idle_add(self._refresh_peers)
 
     def _on_send_message_clicked(self, _button: Gtk.Button, peer: Peer) -> None:
-        """Navigate to messages view and start a conversation with this peer."""
-        logger.debug("UI: send message to peer=%s", peer.display_name)
-        navigate(self, "messages", ("select_dm", peer.display_name))
+        """Open the DM thread with this peer in Messages, ready to compose.
 
-    def _on_request_telemetry_clicked(self, button: Gtk.Button, peer: Peer) -> None:
+        The thread is resolved now, by the peer's identity: the button was
+        built with the peer as it was then, and its name may since belong to
+        somebody else.
+        """
+        current = self._current_peer(peer)
+        if current is None:
+            logger.debug("UI: send message to a peer that left the list")
+            return
+        logger.debug("UI: send message to peer=%s", current.display_name)
+        channel = self._service.ensure_dm_channel(
+            current.display_name, public_key=current.public_key
+        )
+        navigate(self, "messages", ("open_dm", channel.channel_id))
+
+    def _on_request_telemetry_clicked(self, button: Gtk.Button, stale: Peer) -> None:
         """Request telemetry from a peer in a background thread."""
         import threading
+
+        peer = self._current_peer(stale)
+        if peer is None:
+            return
 
         button.set_sensitive(False)
         button.set_label("Requesting...")

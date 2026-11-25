@@ -64,6 +64,18 @@ class Peer:
     is_favorite: bool = False
 
 
+def peer_identity(peer: Peer) -> str:
+    """What identifies a peer across list refreshes: its public key, which
+    stays through renames, else its id.  List positions change with every
+    advert, and a name can pass to another node."""
+    return peer.public_key or peer.peer_id
+
+
+def find_peer(peers: list[Peer], identity: str) -> Peer | None:
+    """The peer in ``peers`` with ``identity``, or None if it is gone."""
+    return next((p for p in peers if peer_identity(p) == identity), None)
+
+
 @dataclass(frozen=True, slots=True)
 class GpsState:
     """What the GPS is doing, as the map's status shows it.
