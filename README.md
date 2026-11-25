@@ -14,6 +14,53 @@ You can run a Mock version of the application on anything that supports Nix, and
 then you can run the real application on the uConsole either by cloning the repo
 and following the below instructions, or installing from the APT repository.
 
+## Keyboard Controls
+
+Everyday use works without the trackball. On the uConsole, keep the D-pad in
+its normal keyboard mode; the same keys work on any keyboard.
+
+| Key | Action |
+| --- | --- |
+| Arrow keys (D-pad) | Move within the focused list, message history, or pan the focused map |
+| `Tab` / `Shift+Tab` | Move to the next / previous control, including the header buttons |
+| `Enter` | Activate the focused control; in the message entry, send |
+| `Esc` | Close the open menu or detail panel, then leave the message entry (the draft is kept) |
+
+| Shortcut | View |
+| --- | --- |
+| `Ctrl+1` | Analyzer |
+| `Ctrl+2` | Peers |
+| `Ctrl+3` | Messages |
+| `Ctrl+4` | Map |
+| `Ctrl+5` | Admin |
+| `Ctrl+6` | Settings |
+
+There are no shortcuts that send or transmit: a message, advert or connect
+always needs `Enter` on its control. Holding `Enter` performs the action once.
+
+**Walkthrough: connect and send a message**
+
+1. `Shift+Tab` from the first control of a page moves into the header, onto
+   **Connect**. Press `Enter`. When it has connected, the focus is back on the
+   button (now **Disconnect**), unless you moved it meanwhile.
+2. `Shift+Tab` past Settings to **Send Advert** and press `Enter` to open the
+   menu. Choose **Flood Advert** or **Direct Advert** with the arrow keys and
+   `Enter`, or close the menu with `Esc`.
+3. `Ctrl+3` opens Messages on the current channel. Up/Down picks a channel.
+   `Tab` moves on to the channel actions, the message history (Up/Down reads
+   it, `Enter` shows a message's details), then the message entry.
+4. Type the message and press `Enter` to send it. `Esc` returns to the channel
+   list. Each channel and DM keeps its own unsent draft until the app closes.
+5. For a DM, `Ctrl+2` opens Peers. Left and Right move between Contacts and
+   Repeaters. Pick a contact with Up/Down, Tab to **Send Message**, and press
+   Enter to open the DM with focus in the message entry.
+
+On the Map (`Ctrl+4`), the arrow keys pan while the map has the focus, and
+`Tab` reaches Zoom In, Zoom Out and My Location (center on this device and
+follow it; panning stops following). The status beside My Location shows
+**GPS fix**, **No GPS fix**, **GPS unavailable**, or **Fixed location** with the
+GPS state when the map uses the position configured in Settings.
+
 ## Install on Raspberry Pi
 
 ### APT Repository (recommended)
